@@ -80,4 +80,32 @@ class CitationChecker(Middleware):
         #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
         #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
         #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+        observed = ctx.observed_text
+        seen_docs = [doc for doc in ctx.corpus.docs if doc.body and doc.body in observed]
+        moved = 0
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            cited = ctx.corpus.get(claim.get("doc_id")) if isinstance(claim.get("doc_id"), str) else None
+            if cited is not None and _on_one_line(text, cited.body):
+                continue
+            source = next((doc for doc in seen_docs if _on_one_line(text, doc.body)), None)
+            if source is not None:
+                claim["doc_id"] = source.doc_id  # đổi nguồn, KHÔNG đổi chữ
+                moved += 1
+        ctx.state["citations_moved"] = ctx.state.get("citations_moved", 0) + moved
+        report["citations"] = sorted(
+            {c["doc_id"] for c in claims if isinstance(c, dict) and isinstance(c.get("doc_id"), str)}
+        )
+        return report
+
+
+def _on_one_line(text: str, body: str) -> bool:
+    """Câu có nằm nguyên văn trong MỘT dòng của body không."""
+    return any(text in line for line in body.splitlines())

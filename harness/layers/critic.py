@@ -72,6 +72,17 @@ from __future__ import annotations
 
 from harness.middleware import Middleware
 
+#: Liên từ mô hình dùng để dán hai nửa câu của hai nguồn khác nhau.
+GLUE = " và "
+
+#: Nửa câu ngắn hơn thế này không đủ làm một trích dẫn có nghĩa.
+MIN_HALF = 15
+
+ABSTAIN_ANSWER = (
+    "Không đủ căn cứ để trả lời: các tài liệu đã đọc không chứa thông tin "
+    "xác thực cho câu hỏi này."
+)
+
 
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
@@ -91,4 +102,80 @@ class Critic(Middleware):
         #     claims = [], citations = [], và viết lại "answer" nói rõ là
         #     không đủ căn cứ.
         #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+        observed = ctx.observed_text
+        kept: list = []
+        split_sides: list[str] = []
+        dropped = 0
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                dropped += 1
+                continue
+            if text in observed:
+                kept.append(claim)
+                continue
+            halves = _split_glued(ctx, text)
+            if halves:
+                for half, doc_id in halves:
+                    kept.append({**claim, "text": half, "doc_id": doc_id})
+                    split_sides.append(half)
+                continue
+            dropped += 1  # bịa: không quan sát nào chứa câu này
+        ctx.state["critic_dropped"] = ctx.state.get("critic_dropped", 0) + dropped
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = ABSTAIN_ANSWER
+            return report
+
+        report["claims"] = kept
+        report["citations"] = sorted(
+            {c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str)}
+        )
+        if split_sides:
+            # Hai nguồn nói khác nhau: nêu nguyên văn từng phía, không chọn.
+            report["abstain"] = True
+            report["answer"] = (
+                "Hai nguồn nội bộ mâu thuẫn nhau nên chưa thể kết luận; xin nêu "
+                "cả hai phía: " + " | ".join(split_sides)
+            )
+        return report
+
+
+def _docs_holding(ctx, text: str) -> list[str]:
+    """doc_id của các tài liệu đã đọc nguyên vẹn có một DÒNG chứa `text`."""
+    if ctx.corpus is None:
+        return []
+    observed = ctx.observed_text
+    return [
+        doc.doc_id
+        for doc in ctx.corpus.docs
+        if doc.body and doc.body in observed
+        and any(text in line for line in doc.body.splitlines())
+    ]
+
+
+def _split_glued(ctx, text: str):
+    """Tách câu ghép tại một chỗ dán GLUE thành hai nửa thuộc hai tài liệu.
+
+    Mỗi nửa là substring nguyên văn của chữ mô hình (cắt, không sửa), phải
+    nằm trong quan sát và trên một dòng của một tài liệu đã đọc; hai nửa
+    phải đến từ hai tài liệu khác nhau. Trả về [(nửa, doc_id), ...] hoặc None.
+    """
+    observed = ctx.observed_text
+    start = text.find(GLUE)
+    while start != -1:
+        left, right = text[:start], text[start + len(GLUE):]
+        if len(left) >= MIN_HALF and len(right) >= MIN_HALF and left in observed and right in observed:
+            left_docs, right_docs = _docs_holding(ctx, left), _docs_holding(ctx, right)
+            for ld in left_docs:
+                rd = next((d for d in right_docs if d != ld), None)
+                if rd is not None:
+                    return [(left, ld), (right, rd)]
+        start = text.find(GLUE, start + 1)
+    return None

@@ -47,6 +47,9 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -69,10 +72,38 @@ class InjectionGuard(Middleware):
         #     cắt từ BLOCK_START tới hết chuỗi.
         #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
         #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = result.content
+        if not isinstance(content, str) or (
+            BLOCK_START not in content and INJECTION_CANARY not in content
+        ):
+            return result
+        while BLOCK_START in content:
+            start = content.find(BLOCK_START)
+            end = content.find(BLOCK_END, start)
+            if end == -1:
+                # Fetch bị cắt giữa chừng: không có dấu đóng, bỏ tới hết chuỗi.
+                content = content[:start] + PLACEHOLDER
+                break
+            content = content[:start] + PLACEHOLDER + content[end + len(BLOCK_END):]
+        # Canary lạc ngoài khối vẫn là lệnh độc: gỡ nốt.
+        content = content.replace(INJECTION_CANARY, PLACEHOLDER)
+        ctx.state["injection_blocks_removed"] = ctx.state.get("injection_blocks_removed", 0) + 1
+        return ToolResult(ok=result.ok, content=content, error=result.error)
 
     def after_agent(self, ctx, report):
         # TODO (§10): 2-4 dòng.
         #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
         #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        # Scorer soát canary trên TOÀN BỘ report: làm sạch mọi trường chữ
+        # tự do, còn claim dính canary thì XOÁ (không bao giờ sửa chữ).
+        for key, value in list(report.items()):
+            if key != "claims" and isinstance(value, str) and INJECTION_CANARY in value:
+                report[key] = value.replace(INJECTION_CANARY, "").strip()
+        claims = report.get("claims")
+        if isinstance(claims, list) and INJECTION_CANARY in str(claims):
+            report["claims"] = [c for c in claims if INJECTION_CANARY not in str(c)]
+            report["citations"] = sorted(
+                {c["doc_id"] for c in report["claims"]
+                 if isinstance(c, dict) and isinstance(c.get("doc_id"), str)}
+            )
+        return report
