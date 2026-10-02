@@ -60,6 +60,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 from __future__ import annotations
 
 from harness.middleware import Middleware
+from harness.quoting import Evidence
 
 
 class CitationChecker(Middleware):
@@ -68,44 +69,25 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
+        # Câu có trong bằng chứng nhưng gắn sai tài liệu -> GẮN LẠI.
+        # Câu không có trong bằng chứng nào -> để nguyên cho `critic` xoá.
         claims = report.get("claims")
         if not isinstance(claims, list) or not claims or ctx.corpus is None:
             return report
-        observed = ctx.observed_text
-        seen_docs = [doc for doc in ctx.corpus.docs if doc.body and doc.body in observed]
+        evidence = Evidence(ctx)
         moved = 0
         for claim in claims:
-            if not isinstance(claim, dict):
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
                 continue
-            text = claim.get("text")
-            if not isinstance(text, str) or not text:
+            cited = claim.get("doc_id")
+            repaired = evidence.repair(claim["text"], cited)
+            if repaired is None:
                 continue
-            cited = ctx.corpus.get(claim.get("doc_id")) if isinstance(claim.get("doc_id"), str) else None
-            if cited is not None and _on_one_line(text, cited.body):
-                continue
-            source = next((doc for doc in seen_docs if _on_one_line(text, doc.body)), None)
-            if source is not None:
-                claim["doc_id"] = source.doc_id  # đổi nguồn, KHÔNG đổi chữ
-                moved += 1
+            # Chỉ CẮT bớt chữ khi cần, và chỉ đổi NGUỒN — không sửa ký tự nào.
+            claim["text"], claim["doc_id"] = repaired
+            moved += repaired[1] != cited
         ctx.state["citations_moved"] = ctx.state.get("citations_moved", 0) + moved
         report["citations"] = sorted(
             {c["doc_id"] for c in claims if isinstance(c, dict) and isinstance(c.get("doc_id"), str)}
         )
         return report
-
-
-def _on_one_line(text: str, body: str) -> bool:
-    """Câu có nằm nguyên văn trong MỘT dòng của body không."""
-    return any(text in line for line in body.splitlines())

@@ -71,12 +71,15 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 from __future__ import annotations
 
 from harness.middleware import Middleware
+from harness.quoting import Evidence, norm
 
 #: Liên từ mô hình dùng để dán hai nửa câu của hai nguồn khác nhau.
 GLUE = " và "
 
-#: Nửa câu ngắn hơn thế này không đủ làm một trích dẫn có nghĩa.
-MIN_HALF = 15
+#: Trần của scorer: quá 4 claim/tài liệu là REDUNDANT, quá 10 là EXCESS —
+#: mỗi cái phạt trọn một claim. Xoá phần thừa là hợp lệ và không mất recall.
+MAX_CLAIMS_PER_DOC = 4
+MAX_CLAIMS = 10
 
 ABSTAIN_ANSWER = (
     "Không đủ căn cứ để trả lời: các tài liệu đã đọc không chứa thông tin "
@@ -90,22 +93,10 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
         claims = report.get("claims")
         if not isinstance(claims, list) or not claims:
             return report
-        observed = ctx.observed_text
+        evidence = Evidence(ctx)
         kept: list = []
         split_sides: list[str] = []
         dropped = 0
@@ -114,16 +105,19 @@ class Critic(Middleware):
             if not isinstance(text, str) or not text.strip():
                 dropped += 1
                 continue
-            if text in observed:
-                kept.append(claim)
+            # Câu (hoặc một đoạn CẮT ra từ nó) là trích dẫn một dòng đã thấy?
+            repaired = evidence.repair(text, claim.get("doc_id"))
+            if repaired is not None:
+                kept.append({**claim, "text": repaired[0]})
                 continue
-            halves = _split_glued(ctx, text)
+            halves = _split_glued(evidence, text)
             if halves:
                 for half, doc_id in halves:
                     kept.append({**claim, "text": half, "doc_id": doc_id})
                     split_sides.append(half)
                 continue
             dropped += 1  # bịa: không quan sát nào chứa câu này
+        kept = _within_scorer_limits(kept)
         ctx.state["critic_dropped"] = ctx.state.get("critic_dropped", 0) + dropped
 
         if not kept:
@@ -147,35 +141,37 @@ class Critic(Middleware):
         return report
 
 
-def _docs_holding(ctx, text: str) -> list[str]:
-    """doc_id của các tài liệu đã đọc nguyên vẹn có một DÒNG chứa `text`."""
-    if ctx.corpus is None:
-        return []
-    observed = ctx.observed_text
-    return [
-        doc.doc_id
-        for doc in ctx.corpus.docs
-        if doc.body and doc.body in observed
-        and any(text in line for line in doc.body.splitlines())
-    ]
+def _within_scorer_limits(claims: list) -> list:
+    """Bỏ claim trùng lặp và phần vượt trần REDUNDANT/EXCESS của scorer."""
+    out, seen, per_doc = [], set(), {}
+    for claim in claims:
+        key = (norm(claim["text"]), claim.get("doc_id"))
+        doc_count = per_doc.get(claim.get("doc_id"), 0)
+        if key in seen or doc_count >= MAX_CLAIMS_PER_DOC or len(out) >= MAX_CLAIMS:
+            continue
+        seen.add(key)
+        per_doc[claim.get("doc_id")] = doc_count + 1
+        out.append(claim)
+    return out
 
 
-def _split_glued(ctx, text: str):
+def _split_glued(evidence: Evidence, text: str):
     """Tách câu ghép tại một chỗ dán GLUE thành hai nửa thuộc hai tài liệu.
 
-    Mỗi nửa là substring nguyên văn của chữ mô hình (cắt, không sửa), phải
-    nằm trong quan sát và trên một dòng của một tài liệu đã đọc; hai nửa
-    phải đến từ hai tài liệu khác nhau. Trả về [(nửa, doc_id), ...] hoặc None.
+    Mỗi nửa là substring nguyên văn của chữ mô hình (cắt, không sửa) và phải
+    là trích dẫn một dòng của một tài liệu đã thấy; hai nửa phải đến từ hai
+    tài liệu khác nhau. Trả về [(nửa, doc_id), ...] hoặc None.
     """
-    observed = ctx.observed_text
     start = text.find(GLUE)
     while start != -1:
         left, right = text[:start], text[start + len(GLUE):]
-        if len(left) >= MIN_HALF and len(right) >= MIN_HALF and left in observed and right in observed:
-            left_docs, right_docs = _docs_holding(ctx, left), _docs_holding(ctx, right)
-            for ld in left_docs:
-                rd = next((d for d in right_docs if d != ld), None)
-                if rd is not None:
-                    return [(left, ld), (right, rd)]
+        left_doc = evidence.source_of(left)
+        if left_doc is not None:
+            right_doc = next(
+                (d for d in evidence.lines if d != left_doc and evidence.supports(d, right)),
+                None,
+            )
+            if right_doc is not None:
+                return [(left, left_doc), (right, right_doc)]
         start = text.find(GLUE, start + 1)
     return None
